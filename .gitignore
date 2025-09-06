@@ -1,3 +1,5 @@
 staging/
 uploads/
 db/
+old/
+__pycache__/

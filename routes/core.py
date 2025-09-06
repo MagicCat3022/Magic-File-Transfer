@@ -1,185 +1,27 @@
-"""
-Resumable LAN File Drop (single-file Flask app)
-
-Features
-- Web UI for uploading files over local network
-- Chunked uploads with resume support (order-agnostic)
-- TCP-based reliability via HTTP; application-level chunk indexing and checksum validation
-- Works even if connection drops; resumes by file name + checksum
-- Concurrent chunk uploads from the browser
-
-Run
-  pip install flask werkzeug
-  python app.py
-Then visit http://<server-ip>:5000 from any device on the same LAN.
-
-Settings
-- UPLOAD_DIR: final assembled files
-- STAGING_DIR: per-upload temporary chunk storage
-- MAX_FILE_SIZE: safety limit (bytes)
-- CHUNK_SIZE_MAX: max accepted chunk size (bytes)
-
-Security notes
-- Filenames are sanitized to prevent path traversal
-- Simple token-less design for trusted LANs. Add auth/restrictions for wider use.
-"""
-from __future__ import annotations
-
+# routes/core.py
+from flask import Blueprint, Response, jsonify, make_response, render_template_string, request, send_from_directory
 import hashlib
-import json
 import os
 import shutil
-import sqlite3
-import string
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
-from flask import (
-    Flask,
-    Response,
-    jsonify,
-    make_response,
-    redirect,
-    render_template_string,
-    request,
-    send_from_directory,
-)
-from werkzeug.utils import secure_filename
+from config import APP_TITLE, UPLOAD_DIR, STAGING_DIR, MAX_FILE_SIZE, CHUNK_SIZE_MAX, DOWNTIME_THRESHOLD
+from db import db_connect, _db_lock
+from utils import sanitize_filename, now_iso
 
-APP_TITLE = "LAN File Drop"
-UPLOAD_DIR = Path("uploads")
-STAGING_DIR = Path("staging")
-DB_PATH = Path("db/filedrop.db")
-MAX_FILE_SIZE = 50 * 1024 * 1024 * 1024  # 50 GiB
-CHUNK_SIZE_MAX = 64 * 1024 * 1024  # 64 MiB per chunk (tune as needed)
-DOWNTIME_THRESHOLD = 2.0  # seconds: gaps longer than this count as downtime
+bp = Blueprint("core", __name__)
 
-UPLOAD_DIR.mkdir(exist_ok=True)
-STAGING_DIR.mkdir(exist_ok=True)
+# load index HTML file
+try:
+    with open("HTML/Index.html", "r", encoding="utf-8") as f:
+        INDEX_HTML = f.read()
+except Exception:
+    INDEX_HTML = "<html><body><h1>Index.html missing</h1></body></html>"
 
-app = Flask(__name__)
-app.config.update(MAX_CONTENT_LENGTH=CHUNK_SIZE_MAX + 1024 * 1024)  # allow some header overhead
-_db_lock = threading.Lock()
-
-
-def db_connect():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def db_init():
-    with db_connect() as con:
-        cur = con.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS uploads (
-                id TEXT PRIMARY KEY,
-                filename TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                chunk_size INTEGER NOT NULL,
-                total_chunks INTEGER NOT NULL,
-                checksum TEXT NOT NULL,
-                finalized INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chunks (
-                upload_id TEXT NOT NULL,
-                idx INTEGER NOT NULL,
-                received_at TEXT NOT NULL,
-                PRIMARY KEY (upload_id, idx),
-                FOREIGN KEY (upload_id) REFERENCES uploads(id)
-            )
-            """
-        )
-        # New per-upload persistent stats table
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS upload_stats (
-                upload_id TEXT PRIMARY KEY,
-                bytes_received INTEGER NOT NULL DEFAULT 0,
-                first_chunk_at TEXT,
-                last_activity_end TEXT,
-                downtime_seconds REAL NOT NULL DEFAULT 0,
-                upload_active_seconds REAL NOT NULL DEFAULT 0,
-                assembly_seconds REAL NOT NULL DEFAULT 0,
-                finalized_at TEXT,
-                FOREIGN KEY (upload_id) REFERENCES uploads(id)
-            )
-            """
-        )
-        # Detailed per-chunk timings (start/end/bytes/duration) for more verbose stats
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chunk_events (
-                upload_id TEXT NOT NULL,
-                idx INTEGER NOT NULL,
-                start_ts TEXT,
-                end_ts TEXT,
-                bytes INTEGER,
-                duration REAL,
-                PRIMARY KEY (upload_id, idx),
-                FOREIGN KEY (upload_id) REFERENCES uploads(id)
-            )
-            """
-        )
-        # Session storage for per-browser logs and last-upload mapping (keyed by cookie)
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                user_id TEXT PRIMARY KEY,
-                last_upload_id TEXT,
-                logs TEXT DEFAULT ''
-            )
-            """
-        )
-        con.commit()
-
-        # Add new columns to upload_stats if they don't exist (idempotent / best-effort)
-        # sqlite won't error on ADD COLUMN attempts when wrapped in try/except
-        extras = [
-            ("upload_start", "TEXT"),
-            ("upload_end", "TEXT"),
-            ("current_concurrency", "INTEGER DEFAULT 0"),
-            ("concurrency_change_at", "TEXT"),
-            ("concurrency_cumulative_seconds", "REAL DEFAULT 0"),
-            ("peak_concurrency", "INTEGER DEFAULT 0"),
-            ("user_id", "TEXT"),
-        ]
-        for col, definition in extras:
-            try:
-                cur.execute(f"ALTER TABLE upload_stats ADD COLUMN {col} {definition}")
-            except Exception:
-                pass
-        # also add user_id column to uploads table if missing so we can associate uploads -> user
-        try:
-            cur.execute("ALTER TABLE uploads ADD COLUMN user_id TEXT")
-        except Exception:
-            pass
-        con.commit()
-
-
-def sanitize_filename(name: str) -> str:
-    # werkzeug.secure_filename plus an extra safety net
-    base = secure_filename(name)
-    # limit length
-    return base[:255] if base else f"upload-{uuid.uuid4().hex}"
-
-
-def now_iso() -> str:
-    # use millisecond precision to avoid second-granularity rounding artifacts
-    return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
-
-
-@app.get("/")
+@bp.get("/")
 def index():
     # Create or preserve a browser cookie that identifies this client
     user_cookie = request.cookies.get("mf_user")
@@ -190,8 +32,7 @@ def index():
     resp.set_cookie("mf_user", user_cookie, max_age=30 * 24 * 3600, httponly=True)
     return resp
 
-
-@app.post("/initiate")
+@bp.post("/initiate")
 def initiate():
     data = request.get_json(force=True)
     filename = sanitize_filename(data.get("filename", ""))
@@ -199,12 +40,9 @@ def initiate():
     chunk_size = int(data.get("chunk_size", 0))
     checksum = (data.get("checksum") or "").lower()
 
-    # filename, size and chunk_size are required; checksum is optional (fallback used when missing)
     if not filename or size <= 0 or chunk_size <= 0:
         return jsonify(error="invalid-params"), 400
     if not checksum:
-        # WebCrypto may be unavailable on non-HTTPS LAN URLs (e.g. http://192.168.x.y).
-        # Use a deterministic fallback key so resume still works when browser couldn't compute SHA-256.
         checksum = f"NOCHK:{filename}:{size}"
 
     if size > MAX_FILE_SIZE:
@@ -214,7 +52,6 @@ def initiate():
 
     total_chunks = (size + chunk_size - 1) // chunk_size
 
-    # Try to find an existing (non-finalized) upload by checksum+filename+size
     with _db_lock, db_connect() as con:
         cur = con.cursor()
         cur.execute(
@@ -224,11 +61,9 @@ def initiate():
         row = cur.fetchone()
         if row:
             upload_id = row["id"]
-            # Use the stored upload parameters so client and server agree on indices
             chunk_size = int(row["chunk_size"])
             total_chunks = int(row["total_chunks"])
             size = int(row["size"])
-            # ensure staging dir exists
             (STAGING_DIR / upload_id).mkdir(parents=True, exist_ok=True)
         else:
             upload_id = uuid.uuid4().hex
@@ -242,13 +77,9 @@ def initiate():
             con.commit()
             (STAGING_DIR / upload_id).mkdir(parents=True, exist_ok=True)
 
-        # ensure a stats row exists for this upload (idempotent)
-        cur.execute(
-            "INSERT OR IGNORE INTO upload_stats (upload_id) VALUES (?)",
-            (upload_id,),
-        )
+        cur.execute("INSERT OR IGNORE INTO upload_stats (upload_id) VALUES (?)", (upload_id,))
         con.commit()
-        # associate upload with current session cookie (if present)
+
         user_id = request.cookies.get("mf_user")
         if user_id:
             try:
@@ -259,7 +90,6 @@ def initiate():
             except Exception:
                 con.rollback()
 
-        # get received chunk indices
         cur.execute("SELECT idx FROM chunks WHERE upload_id=? ORDER BY idx", (upload_id,))
         got = [r[0] for r in cur.fetchall()]
 
@@ -272,11 +102,9 @@ def initiate():
         received_indices=got,
     )
 
-
-@app.put("/upload/<upload_id>/<int:idx>")
+@bp.put("/upload/<upload_id>/<int:idx>")
 def upload_chunk(upload_id: str, idx: int):
-    req_start = time.time()  # measure request start
-    # validate upload exists and params sane
+    req_start = time.time()
     with _db_lock, db_connect() as con:
         cur = con.cursor()
         cur.execute("SELECT * FROM uploads WHERE id=?", (upload_id,))
@@ -289,7 +117,6 @@ def upload_chunk(upload_id: str, idx: int):
         if idx < 0 or idx >= total:
             return jsonify(error="bad-index", total_chunks=total), 400
 
-    # ensure staging dir exists
     chunk_dir = STAGING_DIR / upload_id
     chunk_dir.mkdir(parents=True, exist_ok=True)
     chunk_path = chunk_dir / f"{idx:08d}.part"
@@ -298,35 +125,26 @@ def upload_chunk(upload_id: str, idx: int):
     if not raw:
         return jsonify(error="empty-body"), 400
 
-    # write chunk (overwrite allowed for idempotency)
     with open(chunk_path, "wb") as f:
         f.write(raw)
-    req_end = time.time()  # measure request end
+    req_end = time.time()
 
-    # record in DB (idempotent) and update stats + record per-chunk event
     with _db_lock, db_connect() as con:
         cur = con.cursor()
         try:
-            # check if we already had this chunk to avoid double-counting bytes
             cur.execute("SELECT 1 FROM chunks WHERE upload_id=? AND idx=?", (upload_id, idx))
             existed = cur.fetchone() is not None
 
-            # record chunk presence
             cur.execute(
                 "INSERT OR IGNORE INTO chunks (upload_id, idx, received_at) VALUES (?, ?, ?)",
                 (upload_id, idx, now_iso()),
             )
-            cur.execute(
-                "UPDATE uploads SET updated_at=? WHERE id=?",
-                (now_iso(), upload_id),
-            )
+            cur.execute("UPDATE uploads SET updated_at=? WHERE id=?", (now_iso(), upload_id))
 
-            # ensure stats row exists
             cur.execute("INSERT OR IGNORE INTO upload_stats (upload_id) VALUES (?)", (upload_id,))
             cur.execute("SELECT * FROM upload_stats WHERE upload_id=?", (upload_id,))
             s = cur.fetchone()
 
-            # per-chunk event (start/end/duration/bytes) - used by finalize sweep-line
             start_iso = datetime.fromtimestamp(req_start, timezone.utc).isoformat(timespec="milliseconds").replace('+00:00', 'Z')
             end_iso = datetime.fromtimestamp(req_end, timezone.utc).isoformat(timespec="milliseconds").replace('+00:00', 'Z')
             duration = max(0.0, req_end - req_start)
@@ -335,7 +153,6 @@ def upload_chunk(upload_id: str, idx: int):
                 (upload_id, idx, start_iso, end_iso, len(raw), duration),
             )
 
-            # update aggregated stats (avoid double-count when chunk already existed)
             bytes_prev = int(s["bytes_received"] or 0)
             bytes_new = bytes_prev + (0 if existed else len(raw))
 
@@ -343,24 +160,19 @@ def upload_chunk(upload_id: str, idx: int):
             downtime = float(s["downtime_seconds"] or 0.0)
             active = float(s["upload_active_seconds"] or 0.0)
 
-            # compute gap between previous activity end and this request start
             if last_end:
                 try:
                     last_end_ts = datetime.fromisoformat(last_end.replace("Z", "")).timestamp()
                     gap = req_start - last_end_ts
-                    # If gap > threshold, count as downtime; else count as active gap
                     if gap > DOWNTIME_THRESHOLD:
                         downtime += gap
                     else:
                         active += max(0.0, gap)
                 except Exception:
-                    # ignore parsing errors and continue
                     pass
             else:
-                # first chunk case: mark first_chunk_at
                 cur.execute("UPDATE upload_stats SET first_chunk_at=? WHERE upload_id=?", (now_iso(), upload_id))
 
-            # add this request's duration to active time and update last_activity_end
             active += duration
 
             cur.execute(
@@ -375,8 +187,7 @@ def upload_chunk(upload_id: str, idx: int):
 
     return jsonify(ok=True)
 
-
-@app.get("/status/<upload_id>")
+@bp.get("/status/<upload_id>")
 def status(upload_id: str):
     with _db_lock, db_connect() as con:
         cur = con.cursor()
@@ -388,7 +199,6 @@ def status(upload_id: str):
         cur.execute("SELECT idx FROM chunks WHERE upload_id=? ORDER BY idx", (upload_id,))
         got = [r[0] for r in cur.fetchall()]
 
-        # include basic stats if present
         cur.execute("SELECT * FROM upload_stats WHERE upload_id=?", (upload_id,))
         s = cur.fetchone()
         stats = None
@@ -398,7 +208,6 @@ def status(upload_id: str):
             bytes_received = int(s["bytes_received"] or 0)
             avg_bps = bytes_received / upload_active if upload_active > 0 else None
 
-            # concurrency derived values
             peak_conc = int(s["peak_concurrency"] or 0)
             curr_conc = int(s["current_concurrency"] or 0)
             cum_conc = float(s["concurrency_cumulative_seconds"] or 0.0)
@@ -430,8 +239,7 @@ def status(upload_id: str):
         stats=stats,
     )
 
-
-@app.post("/finalize/<upload_id>")
+@bp.post("/finalize/<upload_id>")
 def finalize(upload_id: str):
     with _db_lock, db_connect() as con:
         cur = con.cursor()
@@ -441,6 +249,7 @@ def finalize(upload_id: str):
             return jsonify(error="unknown-upload"), 404
         if up["finalized"]:
             return jsonify(ok=True, already=True)
+
         total = int(up["total_chunks"])
         chunk_size = int(up["chunk_size"])
         filename = up["filename"]
@@ -448,12 +257,10 @@ def finalize(upload_id: str):
         size = int(up["size"])
         chunk_dir = STAGING_DIR / upload_id
 
-        # verify all chunks exist
-        have = sorted(p for p in chunk_dir.glob("*.part"))
+        have = sorted(p for p in chunk_dir.glob("*.part")) if chunk_dir.exists() else []
         if len(have) != total:
             return jsonify(error="incomplete", have=len(have), need=total), 409
 
-        # assemble
         final_path = UPLOAD_DIR / filename
         tmp_path = final_path.with_suffix(final_path.suffix + ".assembling")
         h = hashlib.sha256()
@@ -484,20 +291,17 @@ def finalize(upload_id: str):
                 tmp_path.unlink(missing_ok=True)
                 return jsonify(error="checksum-mismatch", expected=checksum, got=calc), 422
 
-        # move into place
         if final_path.exists():
             final_path = final_path.with_name(final_path.stem + f"-{upload_id}" + final_path.suffix)
         shutil.move(tmp_path, final_path)
 
-        # mark finalized
         cur.execute("UPDATE uploads SET finalized=1, updated_at=? WHERE id=?", (now_iso(), upload_id))
         con.commit()
 
-        # ensure stats row exists
         cur.execute("INSERT OR IGNORE INTO upload_stats (upload_id) VALUES (?)", (upload_id,))
         con.commit()
 
-        # fetch per-chunk events to compute accurate timings & concurrency
+        # compute per-chunk timing/concurrency using chunk_events
         cur.execute("SELECT start_ts, end_ts FROM chunk_events WHERE upload_id=? ORDER BY start_ts", (upload_id,))
         rows = cur.fetchall()
         timestamps = []
@@ -520,7 +324,6 @@ def finalize(upload_id: str):
         peak_conc = 0
 
         if timestamps:
-            # sweep-line: build events (+1 at start, -1 at end)
             events = []
             for s_ts, e_ts in timestamps:
                 events.append((s_ts, 1))
@@ -541,7 +344,6 @@ def finalize(upload_id: str):
                     peak_conc = curr
             upload_end = last_t
 
-        # derive downtime as span minus union_active (if we have a span)
         downtime = 0.0
         if upload_start is not None and upload_end is not None and upload_end >= upload_start:
             total_span = upload_end - upload_start
@@ -549,7 +351,6 @@ def finalize(upload_id: str):
 
         avg_conc = (cum_conc / union_active) if union_active > 0 else None
 
-        # update upload_stats with computed values
         cur.execute(
             """
             UPDATE upload_stats SET
@@ -577,7 +378,6 @@ def finalize(upload_id: str):
         )
         con.commit()
 
-        # fetch final stats to return
         cur.execute("SELECT * FROM upload_stats WHERE upload_id=?", (upload_id,))
         s = cur.fetchone()
         bytes_received = int(s["bytes_received"] or 0)
@@ -587,7 +387,6 @@ def finalize(upload_id: str):
         peak_conc = int(s["peak_concurrency"] or 0)
         avg_conc = cum_conc / upload_active if upload_active > 0 else None
 
-        # update session last_upload_id so the client can find this upload on refresh
         user_id = request.cookies.get("mf_user")
         if user_id:
             try:
@@ -597,7 +396,7 @@ def finalize(upload_id: str):
             except Exception:
                 con.rollback()
 
-    # cleanup chunks asynchronously (existing trash/move logic follows)
+    # cleanup chunks asynchronously
     trash_dir = STAGING_DIR / "_trash"
     try:
         trash_dir.mkdir(exist_ok=True)
@@ -636,112 +435,7 @@ def finalize(upload_id: str):
         ),
     )
 
-
-@app.get("/downloads/<path:filename>")
+@bp.get("/downloads/<path:filename>")
 def downloads(filename: str):
-    # Serve a completed file back (optional utility)
     safe = sanitize_filename(filename)
     return send_from_directory(UPLOAD_DIR, safe, as_attachment=True)
-
-
-@app.get("/session")
-def get_session():
-    """Return session info for cookie-identified client (last_upload_id and persisted logs)."""
-    user_id = request.cookies.get("mf_user")
-    if not user_id:
-        return jsonify(user_id=None, last_upload_id=None, logs="")
-    with _db_lock, db_connect() as con:
-        cur = con.cursor()
-        cur.execute("SELECT last_upload_id, logs FROM sessions WHERE user_id=?", (user_id,))
-        r = cur.fetchone()
-        if not r:
-            # create empty session row
-            cur.execute("INSERT OR IGNORE INTO sessions (user_id) VALUES (?)", (user_id,))
-            con.commit()
-            return jsonify(user_id=user_id, last_upload_id=None, logs="")
-        return jsonify(user_id=user_id, last_upload_id=r["last_upload_id"], logs=r["logs"] or "")
-
-
-@app.post("/session/log")
-def append_session_log():
-    """Append a short log entry to the server-stored session logs (keeps a bounded tail)."""
-    user_id = request.cookies.get("mf_user")
-    if not user_id:
-        return jsonify(ok=False), 400
-    data = request.get_json(force=True)
-    msg = (data.get("log") or "").strip()
-    if not msg:
-        return jsonify(ok=False), 400
-    with _db_lock, db_connect() as con:
-        cur = con.cursor()
-        cur.execute("INSERT OR IGNORE INTO sessions (user_id) VALUES (?)", (user_id,))
-        cur.execute("SELECT logs FROM sessions WHERE user_id=?", (user_id,))
-        old = cur.fetchone()
-        tail = (old["logs"] or "") if old else ""
-        # append and keep last 32KB to avoid unbounded growth
-        new = (tail + msg + "\n")[-32768:]
-        cur.execute("UPDATE sessions SET logs=? WHERE user_id=?", (new, user_id))
-        con.commit()
-    return jsonify(ok=True)
-
-
-@app.get("/history")
-def get_history():
-    """Return uploads associated with this browser session plus files found in UPLOAD_DIR."""
-    user_id = request.cookies.get("mf_user")
-    uploads = []
-    server_files = []
-    with _db_lock, db_connect() as con:
-        cur = con.cursor()
-        if user_id:
-            # uploads explicitly associated with this user
-            cur.execute(
-                "SELECT id AS upload_id, filename, size, chunk_size, total_chunks, finalized, created_at, updated_at FROM uploads WHERE user_id=? ORDER BY updated_at DESC",
-                (user_id,),
-            )
-            for r in cur.fetchall():
-                uploads.append(
-                    {
-                        "upload_id": r["upload_id"],
-                        "filename": r["filename"],
-                        "size": r["size"],
-                        "chunk_size": r["chunk_size"],
-                        "total_chunks": r["total_chunks"],
-                        "finalized": bool(r["finalized"]),
-                        "created_at": r["created_at"],
-                        "updated_at": r["updated_at"],
-                    }
-                )
-        # Also list any completed files present on disk (uploads table may not include external files)
-        try:
-            for p in UPLOAD_DIR.iterdir():
-                if not p.is_file():
-                    continue
-                try:
-                    st = p.stat()
-                    server_files.append(
-                        {
-                            "filename": p.name,
-                            "size": st.st_size,
-                            "modified_at": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(timespec="milliseconds").replace('+00:00', 'Z'),
-                            "path": f"/downloads/{p.name}",
-                        }
-                    )
-                except Exception:
-                    continue
-        except Exception:
-            pass
-    return jsonify(uploads=uploads, server_files=server_files)
-
-
-# --- Minimal single-page UI with chunked/resumable upload ---
-with open("HTML/Index.html", "r", encoding="utf-8") as f:
-  INDEX_HTML = f.read()
-
-
-if __name__ == "__main__":
-    db_init()
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "5000"))
-    print(f"* Starting {APP_TITLE} on http://{host}:{port}")
-    app.run(host=host, port=port, threaded=True)

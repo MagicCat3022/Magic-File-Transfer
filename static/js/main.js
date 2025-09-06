@@ -412,6 +412,10 @@ window.addEventListener('DOMContentLoaded', () => {
       const div = document.createElement('div');
       div.style.padding = ".35rem .5rem";
       div.style.borderBottom = "1px solid #eee";
+
+      // treat as completed when server-side finalized flag is set OR status === 'completed'
+      const isCompleted = !!e.finalized || (e.status && String(e.status).toLowerCase() === 'completed');
+
       div.innerHTML = `
         <div style="display:flex; justify-content:space-between; gap:8px">
           <div style="min-width:0">
@@ -420,7 +424,7 @@ window.addEventListener('DOMContentLoaded', () => {
             <div style="font-size:.75rem; color:#888">started: ${fmtDate(e.started_at)}</div>
           </div>
           <div style="display:flex; gap:.4rem; align-items:center">
-            ${ e.finalized ? 
+            ${ isCompleted ?
                `<button data-action="remove" data-id="${e.upload_id}" class="btn small">Remove</button>` :
                `<button data-action="pause" data-id="${e.upload_id}" class="btn small">Pause</button>
                 <button data-action="resume" data-id="${e.upload_id}" class="btn small">Resume</button>
