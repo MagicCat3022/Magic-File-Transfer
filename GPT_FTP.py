@@ -34,7 +34,7 @@ import string
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import (
@@ -327,8 +327,8 @@ def upload_chunk(upload_id: str, idx: int):
             s = cur.fetchone()
 
             # per-chunk event (start/end/duration/bytes) - used by finalize sweep-line
-            start_iso = datetime.utcfromtimestamp(req_start).isoformat(timespec="milliseconds") + "Z"
-            end_iso = datetime.utcfromtimestamp(req_end).isoformat(timespec="milliseconds") + "Z"
+            start_iso = datetime.fromtimestamp(req_start, timezone.utc).isoformat(timespec="milliseconds").replace('+00:00', 'Z')
+            end_iso = datetime.fromtimestamp(req_end, timezone.utc).isoformat(timespec="milliseconds").replace('+00:00', 'Z')
             duration = max(0.0, req_end - req_start)
             cur.execute(
                 "INSERT OR REPLACE INTO chunk_events (upload_id, idx, start_ts, end_ts, bytes, duration) VALUES (?, ?, ?, ?, ?, ?)",
@@ -564,8 +564,8 @@ def finalize(upload_id: str):
             WHERE upload_id=?
             """,
             (
-                datetime.utcfromtimestamp(upload_start).isoformat(timespec="milliseconds") + "Z" if upload_start else None,
-                datetime.utcfromtimestamp(upload_end).isoformat(timespec="milliseconds") + "Z" if upload_end else None,
+                datetime.fromtimestamp(upload_start, timezone.utc).isoformat(timespec="milliseconds").replace('+00:00', 'Z') if upload_start else None,
+                datetime.fromtimestamp(upload_end, timezone.utc).isoformat(timespec="milliseconds").replace('+00:00', 'Z') if upload_end else None,
                 union_active,
                 cum_conc,
                 peak_conc,
@@ -723,7 +723,7 @@ def get_history():
                         {
                             "filename": p.name,
                             "size": st.st_size,
-                            "modified_at": datetime.utcfromtimestamp(st.st_mtime).isoformat(timespec="milliseconds") + "Z",
+                            "modified_at": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(timespec="milliseconds").replace('+00:00', 'Z'),
                             "path": f"/downloads/{p.name}",
                         }
                     )
