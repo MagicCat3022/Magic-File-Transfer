@@ -11,4 +11,4 @@ def sanitize_filename(name: str) -> str:
 def now_iso() -> str:
     """UTC ISO timestamp with millisecond precision and trailing Z."""
     # Use timezone-aware formatting to avoid accidental local tz
-    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
