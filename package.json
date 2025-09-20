@@ -1,0 +1,21 @@
+{
+  "name": "magic-file-transfer",
+  "version": "1.0.0",
+  "description": "Node.js rewrite of Magic File Transfer server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "echo \"No tests configured\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.1.0",
+    "fs-extra": "^11.3.2",
+    "multer": "^2.0.2",
+    "nanoid": "^5.1.5"
+  }
+}

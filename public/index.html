@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Magic File Transfer</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main>
+      <section class="card">
+        <h1>Magic File Transfer</h1>
+        <p>
+          Upload large files with resumable, packet-based transfers. Each file is split into indexed packets so that
+          uploads can pause, resume, or recover from interruptions without starting over.
+        </p>
+        <div class="control-row" style="margin-top:1.25rem">
+          <label>
+            <strong>Select files</strong>
+            <input id="fileInput" type="file" multiple />
+          </label>
+          <label>
+            <strong>Chunk size</strong>
+            <select id="chunkSize">
+              <option value="67108864">64 MiB</option>
+              <option value="33554432">32 MiB</option>
+              <option value="16777216">16 MiB</option>
+              <option value="8388608" selected>8 MiB</option>
+              <option value="4194304">4 MiB</option>
+              <option value="2097152">2 MiB</option>
+              <option value="1048576">1 MiB</option>
+              <option value="524288">512 KiB</option>
+              <option value="262144">256 KiB</option>
+            </select>
+          </label>
+          <div>
+            <button id="autoChunk" type="button" class="secondary">Auto optimise</button>
+            <small id="autoChunkHint">Runs a short bandwidth test</small>
+          </div>
+          <label>
+            <input id="persistToggle" type="checkbox" checked />
+            Remember progress if interrupted
+          </label>
+          <button id="startBtn" type="button">Start uploads</button>
+        </div>
+        <div class="control-row" style="margin-top:1rem">
+          <div class="badge">User key: <span id="userKey">--</span></div>
+          <div class="badge">Network packet size: <span id="packetSizeLabel">8 MiB</span></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-title">
+          <h2>Active uploads</h2>
+          <small>Each file uploads independently so you can pause or resume individually.</small>
+        </div>
+        <div id="activeUploads" class="upload-list" data-empty-text="No active uploads"></div>
+      </section>
+
+      <section class="card">
+        <div class="section-title">
+          <h2>Paused uploads</h2>
+          <small>Paused transfers stay here until resumed.</small>
+        </div>
+        <div id="pausedUploads" class="upload-list" data-empty-text="No paused uploads"></div>
+      </section>
+
+      <section class="card">
+        <div class="section-title">
+          <h2>Upload history</h2>
+          <button id="clearHistory" type="button" class="secondary">Clear history</button>
+        </div>
+        <div id="history" data-empty-text="No uploads completed yet"></div>
+      </section>
+
+      <section class="card">
+        <div class="section-title">
+          <h2>Transfer log</h2>
+          <button id="clearLog" type="button" class="secondary">Clear log</button>
+        </div>
+        <pre id="log">Ready.</pre>
+      </section>
+    </main>
+
+    <script src="/js/app.js" type="module"></script>
+  </body>
+</html>
