@@ -1,12 +1,17 @@
 const path = require('path');
 const fs = require('fs-extra');
-const { customAlphabet } = require('nanoid');
 const DataStore = require('./datastore');
 
 const userIdAlphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 const fileIdAlphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-const createUserId = customAlphabet(userIdAlphabet, 16);
-const createFileId = customAlphabet(fileIdAlphabet, 20);
+
+let customAlphabetPromise = null;
+async function loadCustomAlphabet() {
+  if (!customAlphabetPromise) {
+    customAlphabetPromise = import('nanoid').then((mod) => mod.customAlphabet);
+  }
+  return customAlphabetPromise;
+}
 
 class UploadManager {
   constructor({ rootDir, uploadDir, finalDir, statePath }) {
@@ -15,6 +20,8 @@ class UploadManager {
     this.finalDir = finalDir;
     this.store = new DataStore(statePath);
     this.ephemeral = new Map();
+    this._createUserId = null;
+    this._createFileId = null;
   }
 
   _now() {
@@ -47,7 +54,16 @@ class UploadManager {
     return this.ephemeral.get(userKey);
   }
 
+  async _ensureIdFactories() {
+    if (!this._createUserId || !this._createFileId) {
+      const customAlphabet = await loadCustomAlphabet();
+      this._createUserId = customAlphabet(userIdAlphabet, 16);
+      this._createFileId = customAlphabet(fileIdAlphabet, 20);
+    }
+  }
+
   async identifyUser(requestedKey) {
+    await this._ensureIdFactories();
     if (requestedKey) {
       const exists = await this.store.readState((state) => state.users[requestedKey] ? true : false);
       if (exists) {
@@ -60,7 +76,7 @@ class UploadManager {
       let candidate = requestedKey;
       if (!candidate || state.users[candidate]) {
         do {
-          candidate = createUserId();
+          candidate = this._createUserId();
         } while (state.users[candidate]);
       }
       if (!state.users[candidate]) {
@@ -139,8 +155,9 @@ class UploadManager {
   }
 
   async createUpload(userKey, { fileName, fileSize, chunkSize, persist }) {
+    await this._ensureIdFactories();
     const totalChunks = Math.ceil(fileSize / chunkSize);
-    const uploadId = createFileId();
+    const uploadId = this._createFileId();
     const now = this._now();
     const baseMetadata = {
       id: uploadId,
