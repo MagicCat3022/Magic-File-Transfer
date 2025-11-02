@@ -189,6 +189,42 @@ class UploadManager {
     return this._decorateUpload(baseMetadata);
   }
 
+  // New: idempotent "ensure" by client-chosen uploadId
+  async ensureUpload(uploadId, meta) {
+    await this._ensureIdFactories();
+    const now = this._now();
+    const base = {
+      id: uploadId,
+      userKey: meta.userKey,
+      fileName: meta.fileName,
+      fileSize: meta.fileSize,
+      chunkSize: meta.chunkSize,
+      totalChunks: meta.totalChunks,
+      persist: meta.persist !== false,
+      status: 'active',
+      receivedChunks: {},
+      receivedCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    // If already exists in persistent or ephemeral, return decorated snapshot.
+    const existing = await this.getUpload(meta.userKey, uploadId);
+    if (existing?.upload) return existing.upload;
+    // Otherwise create (persist or memory)
+    if (base.persist) {
+      await this.store.withState((state) => {
+        const user = this._ensureUserRecord(state, meta.userKey);
+        user.uploads[uploadId] = base;
+        return null;
+      });
+    } else {
+      const mem = this._ensureEphemeralUser(meta.userKey);
+      mem.uploads.set(uploadId, base);
+    }
+    await fs.ensureDir(path.join(this.uploadDir, uploadId));
+    return this._decorateUpload(base);
+  }
+
   async getUpload(userKey, uploadId) {
     const ephemeralUser = this.ephemeral.get(userKey);
     if (ephemeralUser && ephemeralUser.uploads.has(uploadId)) {
@@ -204,7 +240,18 @@ class UploadManager {
     });
 
     if (!exists) {
-      return null;
+      // Fallback: if chunk dir exists, reconstruct a minimal upload view
+      const dir = path.join(this.uploadDir, uploadId);
+      const dirExists = await fs.pathExists(dir);
+      if (!dirExists) return null;
+      const guess = { id: uploadId, userKey, fileName: '(unknown)', fileSize: 0, chunkSize: 0,
+        totalChunks: 0, persist: true, status: 'active', receivedChunks: {}, receivedCount: 0,
+        createdAt: this._now(), updatedAt: this._now() };
+      const scan = await this.inspectChunks(uploadId);
+      guess.receivedChunks = Object.fromEntries(scan.present.map(i => [i, true]));
+      guess.receivedCount = scan.present.length;
+      // Note: client should supply real meta via PUT ensure; this view is just to enable purge.
+      return { location: 'filesystem', upload: this._decorateUpload(guess) };
     }
 
     return { location: 'persistent', upload: exists };
@@ -312,6 +359,7 @@ class UploadManager {
       chunkSize: upload.chunkSize,
       totalChunks: upload.totalChunks,
       persist: upload.persist !== false,
+      status: upload.status || 'completed',
     };
   }
 
@@ -331,16 +379,7 @@ class UploadManager {
     if (memoryUser && memoryUser.uploads.has(uploadId)) {
       const upload = memoryUser.uploads.get(uploadId);
       memoryUser.uploads.delete(uploadId);
-      if (!forget) {
-        await this.store.withState((state) => {
-          const user = this._ensureUserRecord(state, userKey);
-          user.history.unshift(this._toHistoryEntry(upload));
-          if (user.history.length > 200) {
-            user.history = user.history.slice(0, 200);
-          }
-          return null;
-        });
-      }
+      if (!forget) { /* no-op here; use cancelUpload for history with status */ }
       return this._decorateUpload(upload);
     }
 
@@ -351,22 +390,98 @@ class UploadManager {
       }
       const upload = user.uploads[uploadId];
       const decorated = this._decorateUpload(upload);
-      if (!forget) {
-        user.history.unshift(this._toHistoryEntry(upload));
-        if (user.history.length > 200) {
-          user.history = user.history.slice(0, 200);
-        }
-      }
+      // no history here; use cancelUpload if you want a cancelled entry
       delete user.uploads[uploadId];
       return decorated;
     });
   }
 
+  async cancelUpload(userKey, uploadId) {
+    // Moves to history with status = 'cancelled' (idempotent)
+    return this.store.withState((state) => {
+      const user = state.users[userKey];
+      if (!user) return null;
+      const src = user.uploads?.[uploadId];
+      if (!src) return null;
+      src.status = 'cancelled';
+      src.updatedAt = this._now();
+      const entry = this._toHistoryEntry(src);
+      entry.status = 'cancelled';
+      user.history.unshift(entry);
+      if (user.history.length > 200) user.history = user.history.slice(0, 200);
+      delete user.uploads[uploadId];
+      return this._decorateUpload(src);
+    });
+  }
+
+  async forgetUpload(userKey, uploadId) {
+    // Removes from state without history (idempotent)
+    return this.store.withState((state) => {
+      const user = state.users[userKey];
+      if (!user) return null;
+      if (user.uploads && user.uploads[uploadId]) {
+        delete user.uploads[uploadId];
+      }
+      return null;
+    });
+  }
+
+  async purgeUploadDir(uploadId/*, userKey*/) {
+    const dir = path.join(this.uploadDir, uploadId);
+    const exists = await fs.pathExists(dir);
+    if (exists) await fs.remove(dir);
+    return true;
+  }
+
+  async inspectChunks(uploadId) {
+    const dir = path.join(this.uploadDir, uploadId);
+    const present = [];
+    if (await fs.pathExists(dir)) {
+      const files = await fs.readdir(dir);
+      for (const f of files) {
+        const m = f.match(/^(\d+)\.part$/);
+        if (m) present.push(Number(m[1]));
+      }
+      present.sort((a,b)=>a-b);
+    }
+    return { uploadId, present };
+  }
+
+  async lookupUpload(userKey, fileName, fileSize) {
+    const fromState = await this.store.readState((state) => {
+      const user = state.users[userKey];
+      if (!user) return null;
+      const uploads = Object.values(user.uploads || {});
+      return uploads.find(u => u.fileName === fileName && u.fileSize === fileSize) || null;
+    });
+    if (fromState) return this._decorateUpload(fromState);
+    const eph = this.ephemeral.get(userKey);
+    if (eph) {
+      for (const u of eph.uploads.values()) {
+        if (u.fileName === fileName && u.fileSize === fileSize) return this._decorateUpload(u);
+      }
+    }
+    return null;
+  }
+
   async assembleFile(upload) {
     const safeName = this._safeFileName(upload.fileName);
-    const finalPath = path.join(this.finalDir, `${upload.id}-${safeName}`);
     await fs.ensureDir(this.finalDir);
-    const writeStream = fs.createWriteStream(finalPath);
+    let target = path.join(this.finalDir, safeName);
+    // If collision, append [userKey], then (n) as needed
+    if (await fs.pathExists(target)) {
+      const ext = path.extname(safeName);
+      const base = path.basename(safeName, ext);
+      target = path.join(this.finalDir, `${base} [${upload.userKey}]${ext}`);
+      if (await fs.pathExists(target)) {
+        let n = 2;
+        do {
+          target = path.join(this.finalDir, `${base} [${upload.userKey}] (${n})${ext}`);
+          n += 1;
+        } while (await fs.pathExists(target));
+      }
+    }
+    const writeStream = fs.createWriteStream(target);
 
     for (let i = 0; i < upload.totalChunks; i += 1) {
       const chunkPath = path.join(this.uploadDir, upload.id, `${i}.part`);
@@ -390,7 +505,7 @@ class UploadManager {
     });
 
     await fs.remove(path.join(this.uploadDir, upload.id));
-    return finalPath;
+    return target;
   }
 
   _safeFileName(name) {

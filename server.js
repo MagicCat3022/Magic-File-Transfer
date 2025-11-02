@@ -41,33 +41,49 @@ app.use((req, res, next) => {
 
 app.use(express.static(path.join(ROOT, 'public')));
 
-function parseInteger(value, fieldName) {
-  const result = Number.parseInt(value, 10);
-  if (Number.isNaN(result)) {
-    const err = new Error(`invalid_${fieldName}`);
-    err.statusCode = 400;
-    throw err;
-  }
-  return result;
-}
+// --- New: idempotent create by client-supplied uploadId (RESTful) ---
+app.put('/api/uploads/:uploadId', async (req, res, next) => {
+  try {
+    const { userKey, fileName, fileSize, chunkSize, persist = true, totalChunks } = req.body || {};
+    if (!userKey || !fileName || !Number.isFinite(fileSize) || !Number.isFinite(chunkSize)) {
+      const error = new Error('missing_or_invalid_fields');
+      error.statusCode = 400;
+      throw error;
+    }
+    const upload = await manager.ensureUpload(req.params.uploadId, {
+      userKey,
+      fileName,
+      fileSize: Number(fileSize),
+      chunkSize: Number(chunkSize),
+      totalChunks: Number.isFinite(totalChunks) ? Number(totalChunks) : Math.ceil(fileSize / chunkSize),
+      persist: persist !== false && persist !== 'false',
+    });
+    res.json({ upload });
+  } catch (err) { next(err); }
+});
 
-async function ensureChunkDirectory(uploadId) {
-  const dir = path.join(UPLOAD_DIR, uploadId);
-  await fs.ensureDir(dir);
-  return dir;
-}
+// --- New: probe which chunks exist by scanning filesystem (stateless resume) ---
+app.get('/api/uploads/:uploadId/chunks', async (req, res, next) => {
+  try {
+    const info = await manager.inspectChunks(req.params.uploadId);
+    res.json(info);
+  } catch (err) { next(err); }
+});
 
-function sanitizeError(err) {
-  if (err instanceof Error && err.statusCode) {
-    return err;
-  }
-  const error = new Error('internal_error');
-  error.statusCode = 500;
-  if (process.env.NODE_ENV !== 'production') {
-    error.details = err.message;
-  }
-  return error;
-}
+// --- New: lookup by (userKey, fileName, fileSize) to find active/paused ---
+app.get('/api/uploads/lookup', async (req, res, next) => {
+  try {
+    const { userKey, fileName } = req.query || {};
+    const fileSize = Number(req.query?.fileSize);
+    if (!userKey || !fileName || !Number.isFinite(fileSize)) {
+      const error = new Error('missing_or_invalid_fields');
+      error.statusCode = 400;
+      throw error;
+    }
+    const match = await manager.lookupUpload(userKey, fileName, fileSize);
+    res.json({ match });
+  } catch (err) { next(err); }
+});
 
 app.post('/api/users/identify', async (req, res, next) => {
   try {
@@ -201,10 +217,10 @@ app.post('/api/uploads/:uploadId/state', async (req, res, next) => {
     } else if (action === 'resume') {
       response = await manager.updateStatus(userKey, req.params.uploadId, 'active');
     } else if (action === 'cancel') {
-      response = await manager.removeUpload(userKey, req.params.uploadId, { forget: false });
-      await fs.remove(path.join(UPLOAD_DIR, req.params.uploadId));
+      response = await manager.cancelUpload(userKey, req.params.uploadId); // marks cancelled in history
+      await fs.remove(path.join(UPLOAD_DIR, req.params.uploadId));         // idempotent purge of chunks
     } else if (action === 'forget') {
-      response = await manager.removeUpload(userKey, req.params.uploadId, { forget: true });
+      response = await manager.forgetUpload(userKey, req.params.uploadId); // no history entry
       await fs.remove(path.join(UPLOAD_DIR, req.params.uploadId));
     } else {
       const error = new Error('invalid_action');
@@ -247,6 +263,14 @@ app.post('/api/network/probe', probeUpload.single('sample'), async (req, res, ne
     next(err);
   }
 });
+
+function sanitizeError(err) {
+  return {
+    message: err.message,
+    details: process.env.NODE_ENV === 'production' ? undefined : err.stack,
+    statusCode: err.statusCode || 500,
+  };
+}
 
 app.use((err, req, res, next) => {
   const error = sanitizeError(err);

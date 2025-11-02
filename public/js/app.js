@@ -16,6 +16,9 @@ const autoChunkHint = document.getElementById('autoChunkHint');
 let userKey = null;
 let uploadsSnapshot = { active: [], paused: [], history: [] };
 const uploadTasks = new Map();
+const MAX_CONCURRENT_FILES = 3; // limit to keep control-plane requests responsive
+let runningTasks = 0;
+const fileQueue = [];
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes)) {
@@ -217,6 +220,8 @@ class UploadTask {
 
   async processQueue() {
     while (!this.cancelled) {
+      // Yield to UI so pause/cancel clicks get processed even with tiny chunks
+      await new Promise(requestAnimationFrame);
       if (this.paused) {
         await new Promise((resolve) => {
           this.resumeResolver = resolve;
@@ -336,14 +341,33 @@ async function startUploads() {
     return;
   }
 
-  const chunkSize = Number(chunkSizeSelect.value);
-  const persist = persistToggle.checked;
-
   for (const file of files) {
-    const pausedMatch = uploadsSnapshot.paused.find((upload) => upload.fileName === file.name && upload.fileSize === file.size);
-    if (pausedMatch) {
+    // Throttle per-file concurrency
+    if (runningTasks >= MAX_CONCURRENT_FILES) {
+      fileQueue.push(file);
+      continue;
+    }
+    runningTasks++;
+    const chunkSize = Number(chunkSizeSelect.value);
+    const persist = persistToggle.checked;
+
+    // Find paused OR active match (after refresh an "active" may need resuming)
+    let match = uploadsSnapshot.paused.find(u => u.fileName === file.name && u.fileSize === file.size)
+             || uploadsSnapshot.active.find(u => u.fileName === file.name && u.fileSize === file.size);
+    if (!match) {
+      // fallback to server lookup
       try {
-        const metaResponse = await fetch(`/api/uploads/${pausedMatch.id}?userKey=${encodeURIComponent(userKey)}`);
+        const qs = new URLSearchParams({ userKey, fileName: file.name, fileSize: String(file.size) });
+        const r = await fetch(`/api/uploads/lookup?${qs.toString()}`);
+        if (r.ok) {
+          const j = await r.json();
+          match = j.match || null;
+        }
+      } catch {}
+    }
+    if (match) {
+      try {
+        const metaResponse = await fetch(`/api/uploads/${match.id}?userKey=${encodeURIComponent(userKey)}`);
         if (!metaResponse.ok) {
           throw new Error('Failed to load paused upload metadata');
         }
@@ -355,10 +379,10 @@ async function startUploads() {
         const task = new UploadTask(file, uploadMeta, {
           userKey,
           chunkSize: uploadMeta.chunkSize,
-          persist: pausedMatch.persist,
+          persist: match.persist,
         });
-        uploadTasks.set(pausedMatch.id, task);
-        const resumeData = await postUploadAction(pausedMatch.id, 'resume');
+        uploadTasks.set(match.id, task);
+        const resumeData = await postUploadAction(match.id, 'resume');
         if (resumeData.upload) {
           task.resume(resumeData.upload);
         }
@@ -366,20 +390,18 @@ async function startUploads() {
       } catch (error) {
         log(`Failed to resume ${file.name}: ${error.message}`);
       }
+      runningTasks--;
       continue;
     }
 
     try {
-      const response = await fetch('/api/uploads', {
-        method: 'POST',
+      // Client-chosen uploadId: stable hash (name+size+lastModified+userKey)
+      const uploadId = await stableIdFor(file, userKey);
+      // Idempotent declare (stateless)
+      const response = await fetch(`/api/uploads/${uploadId}`, {
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userKey,
-          fileName: file.name,
-          fileSize: file.size,
-          chunkSize,
-          persist,
-        }),
+        body: JSON.stringify({ userKey, fileName: file.name, fileSize: file.size, chunkSize, persist }),
       });
       if (!response.ok) {
         throw new Error(`Failed to create upload (${response.status})`);
@@ -394,6 +416,7 @@ async function startUploads() {
     } catch (error) {
       log(`Failed to start upload for ${file.name}: ${error.message}`);
     }
+    runningTasks--;
   }
 
   fileInput.value = '';
@@ -450,6 +473,7 @@ function handleUploadButtonClick(event) {
           resumeTask.resume(updated);
         } else if (updated) {
           log(`Select the original file to resume upload ${updated.fileName}.`);
+          alert(`To resume "${updated.fileName}", please choose the original file again.`);
         }
       }
     })
@@ -513,3 +537,24 @@ identifyUser().catch((error) => {
   log(`Failed to initialise: ${error.message}`);
 });
 updatePacketLabel();
+
+// Stable ID utility (SHA-256 of name|size|lastModified|userKey)
+async function stableIdFor(file, userKey) {
+  const enc = new TextEncoder();
+  const preimage = `${file.name}|${file.size}|${file.lastModified || 0}|${userKey}`;
+  const digest = await crypto.subtle.digest('SHA-256', enc.encode(preimage));
+  const hex = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+  // keep it short but collision-resistant enough for local use
+  return hex.slice(0, 40);
+}
+
+// Be resilient on tab close/reload: pause active uploads quickly
+window.addEventListener('beforeunload', () => {
+  for (const [id, task] of uploadTasks) {
+    try { task.pause(); } catch {}
+    try {
+      navigator.sendBeacon(`/api/uploads/${id}/state`,
+        new Blob([JSON.stringify({ userKey, action: 'pause' })], { type: 'application/json' }));
+    } catch {}
+  }
+});
